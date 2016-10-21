@@ -24,19 +24,30 @@ using namespace std;
 
 char statusfile_path[100];
 char commandfile_path[100];
+char tsfile_path[100];
 string last_state;
 //bool status_changed=false;
 bool in_changed=false;
 int currentstate;
-bool LEDs[3] = {false};
+bool POut[4] = {false};
 bool Buttons[3] = {false};
-unsigned long last_tick[5] = {0}; // 0: Buttons - 1: butt-state - 2: call-button-blocker - 3: call-button-blink - 4: confirm-call
+unsigned long last_tick[8] = {0}; // 0: Buttons - 1: butt-state - 2: call-button-debouncer - 3: call-button-blink - 4: confirm-call - 5: command-reset-request - 6: on/offAir-buttons-debouncer - 7: on/offAir-blink
 unsigned long CurrentTimeMS;
 bool action_triggered=false;
 int last_in_buffer=0;
 bool call_enabled=false;
 bool call_led_enabled=false;
 bool confirm_call=false;
+bool command_reset_request=false;
+bool error_signal=false;
+bool dial_signal=false;
+bool error_led_enabled=false;
+bool dial_led_enabled=false;
+unsigned long startup_ts=0;
+bool pre_startup_notified=false;
+bool startup_notified=false;
+bool startup_call_enabled=false;
+bool startup_call_led_enabled=false;
 
 unsigned long GetCurrentTimeMS (void)
 {
@@ -44,6 +55,11 @@ unsigned long GetCurrentTimeMS (void)
 	gettimeofday(&tp, NULL);
 	long int ms = tp.tv_sec * 1000 + tp.tv_usec / 1000;
 	return ms;
+}
+
+unsigned long MStoSec(unsigned long MS)
+{
+	return MS/1000;
 }
 
 
@@ -84,48 +100,6 @@ void GetCurrentButtons()
 	
 }
 
-/*void GetCurrentButtState()
-{
-	string line;
-	ifstream statusfile_handle(statusfile_path);
-	if(statusfile_handle.is_open())
-	{
-		getline(statusfile_handle,line);
-		statusfile_handle.close();
-		
-		if(line != last_state) // state changed
-		{
-			//cout << "CHANGE" << endl;
-			status_changed=true;
-			if(line == "conn")
-			{
-				currentstate=0;
-			}
-			else if(line == "disconn")
-				{
-				currentstate=1;
-			}
-			else if(line == "error")
-				{
-				currentstate=2;
-			}
-			else
-			{
-				currentstate=255;
-			}
-			last_state=line;
-		}*else {
-			cout << "unchanged" << endl;
-			cout << "-" << line << "-" << endl;
-			cout << "-" << last_state << "-" << endl;
-			cout << "EOM" << endl;
-		}
-		
-	} else {
-		cout << "Error opening statusfile" << endl;
-	}
-}*/
-
 void SetButtCommand(string ButtCommand)
 {
 	ofstream commandfile_handle;
@@ -134,14 +108,22 @@ void SetButtCommand(string ButtCommand)
 	commandfile_handle.close();
 }
 
-void setLED(int led,bool status)
+void ScheduleCommandReset()
 {
-	LEDs[led-1]=status;
-	int led_value=0;
-	if(LEDs[0]) led_value=led_value+1; // offAir	(1)
-	if(LEDs[1]) led_value=led_value+2; // Call	(2)
-	if(LEDs[2]) led_value=led_value+4; // onAir	(3)
-	outb(led_value, BASEPORT);
+	command_reset_request=true;
+	last_tick[5]=CurrentTimeMS;
+	//cout << "SCH" << endl;
+}
+
+void setOut(int led,bool status)
+{
+	POut[led-1]=status;
+	int out_value=0;
+	if(POut[0]) out_value=out_value+1; // LED offAir	(1)
+	if(POut[1]) out_value=out_value+2; // LED Call		(2)
+	if(POut[2]) out_value=out_value+4; // LED onAir		(3)
+	if(POut[3]) out_value=out_value+8; // Relais BRadio	(4)
+	outb(out_value, BASEPORT);
 }
 
 int main()
@@ -170,9 +152,24 @@ int main()
         strcpy(commandfile_path,getenv("HOME"));
         strcat(commandfile_path,"/.butt_command.dat");
 	
+	strcpy(tsfile_path,getenv("HOME"));
+        strcat(tsfile_path,"/.butt_ts.dat");
+	
 	cout << "Using IO files:" << endl;
-	cout << "statusfile: " << statusfile_path << endl;
-	cout << "commandfile: " << commandfile_path << endl;
+	cout << "status file: " << statusfile_path << endl;
+	cout << "command file: " << commandfile_path << endl;
+	cout << "timestamp file" << tsfile_path << endl;
+	
+	string line;
+	ifstream tsfile_handle(tsfile_path);
+	if(tsfile_handle.is_open())
+	{
+		getline(tsfile_handle,line);
+		tsfile_handle.close();
+		startup_ts=stoi(line);
+		//cout << startup_ts << endl;
+		//cout << time(0) << endl;
+	}
 	
 	while(true)
 	{
@@ -181,6 +178,38 @@ int main()
 		bool WorkedHard=false;
 		
 		CurrentTimeMS=GetCurrentTimeMS();
+		unsigned long CurrentTimeSec=time(0);
+		if(CurrentTimeSec>=startup_ts-300 && CurrentTimeSec<startup_ts && !pre_startup_notified) // Is it within five minutes before the beginning and we haven't enabled the pre-notification yet?
+		{
+			call_enabled=true; // enable Call
+			pre_startup_notified=true;
+			WorkedHard=true;
+		}
+		
+		if(CurrentTimeSec>=startup_ts-10 && CurrentTimeSec<startup_ts+300 && !startup_notified) // Is it within 10 seconds before (or less than five minutes after) the beginning and we haven't enabled the notification yet?
+		{
+			startup_call_enabled=true;
+			startup_notified=true;
+			WorkedHard=true;
+		}
+		
+		if(startup_call_enabled) // Is a startup call currently active?
+		{
+			if(CurrentTimeMS>=last_tick[7]+150) // Toggle every 150 ms
+			{
+				if(startup_call_led_enabled)
+				{
+					setOut(3,false);
+					startup_call_led_enabled=false;
+				} else {
+					setOut(3,true);
+					startup_call_led_enabled=true;
+				}
+				last_tick[7]=CurrentTimeMS;
+				WorkedHard=true;
+			}
+		}
+		
 		
 		if(CurrentTimeMS>=last_tick[0]+100) // Check buttons every 100 ms
 		{
@@ -188,10 +217,11 @@ int main()
 			GetCurrentButtons();
 			if(in_changed)
 			{
-				if(Buttons[0]) // offAir
+				if(Buttons[0] && CurrentTimeMS>=last_tick[6]+1000) // offAir (debounce 1000ms)
 				{
 					SetButtCommand("disconn");
-					// TODO: Reset command ?
+					//ScheduleCommandReset();
+					last_tick[6]=CurrentTimeMS;
 				}
 				if(Buttons[1]) // Call
 				{
@@ -205,28 +235,96 @@ int main()
 						} else {
 							call_enabled=false;
 							confirm_call=true; // If disabled, the call must be confirmed by lighting up the LED for 3 Seconds
-							setLED(2,true);
+							setOut(2,true);
 							last_tick[4]=CurrentTimeMS;
 						}
 						last_tick[2]=CurrentTimeMS;
 						//cout << "Toggle Call" << endl;
 					}
 				}
-				if(Buttons[2]) // onAir
+				if(Buttons[2] && CurrentTimeMS>=last_tick[6]+1000) // onAir
 				{
 					SetButtCommand("conn");
-					// TODO: Reset command ?
+					//ScheduleCommandReset();
+					last_tick[6]=CurrentTimeMS;
 				}
 			}
 			
 			last_tick[0]=CurrentTimeMS;
 			WorkedHard=true;
+		} // End of button check
+		
+		if(CurrentTimeMS>=last_tick[1]+300) // Check butt state every 300 ms
+		{
+			string line;
+			ifstream statusfile_handle(statusfile_path);
+			if(statusfile_handle.is_open())
+			{
+				getline(statusfile_handle,line);
+				statusfile_handle.close();
+				
+				if(line != last_state) // state changed
+				{
+					//cout << "CHANGE" << endl;
+					//status_changed=true;
+					if(line == "conn")
+					{
+						error_signal=false; // diable error signal
+						dial_signal=false; // disable dial signal
+						setOut(1,false); // disable offAir
+						setOut(3,true); // enable onAir
+						setOut(4,true); // enable BRadio-Relais
+						
+						if(startup_call_enabled) // Disable startup call (if enabled) and reset tick counter
+						{
+							startup_call_enabled=false;
+							startup_call_led_enabled=false;
+							last_tick[7]=0;
+						}
+					}
+					else if(line == "disconn")
+					{
+						error_signal=false; // diable error signal
+						dial_signal=false; // disable dial signal
+						setOut(1,true); // enable offAir
+						setOut(3,false); // disable onAir
+						setOut(4,false); // disable BRadio-Relais
+					}
+					else if(line == "error")
+					{
+						error_signal=true; // enable error signal
+						dial_signal=false; // disable dial signal
+						setOut(1,false); // disable offAir
+						setOut(3,false); // disable onAir
+						//cout << "err" << endl;
+					}
+					else if(line == "dial")
+					{
+						dial_signal=true;
+						setOut(1,true); // ensable offAir
+						setOut(3,false); // disable onAir
+					}
+					last_state=line;
+				}
+				
+			}
+			last_tick[1]=CurrentTimeMS;
+			WorkedHard=true;
+		}
+		
+		if(command_reset_request && CurrentTimeMS>=last_tick[5]+1000) // If there's a reset request, we must execute if after 1 second!
+		{
+			SetButtCommand("none");
+			command_reset_request=false;
+			//cout << "RST" << endl;
+			WorkedHard=true;
 		}
 		
 		if(confirm_call && CurrentTimeMS>=last_tick[4]+3000) // Do we have to confirm a call and have 3 seconds passed?
 		{
-			setLED(2,false);
+			setOut(2,false);
 			confirm_call=false;
+			WorkedHard=true;
 		}
 		
 		if(call_enabled) // If the call is set, we need to toggle the LED
@@ -235,13 +333,51 @@ int main()
 			{
 				if(call_led_enabled)
 				{
-					setLED(2,false);
+					setOut(2,false);
 					call_led_enabled=false;
 				} else {
-					setLED(2,true);
+					setOut(2,true);
 					call_led_enabled=true;
 				}
 				last_tick[3]=CurrentTimeMS;
+			}
+			WorkedHard=true;
+		}
+		
+		if(dial_signal) // Is butt on dial state?
+		{
+			if(CurrentTimeMS>=last_tick[7]+200) // Toggle on/offAir every 200 ms
+			{
+				if(dial_led_enabled)
+				{
+					setOut(3,false);
+					setOut(1,true);
+					dial_led_enabled=false;
+				} else {
+					setOut(3,true);
+					setOut(1,false);
+					dial_led_enabled=true;
+				}
+				last_tick[7]=CurrentTimeMS;
+			}
+			WorkedHard=true;
+		}
+		
+		if(error_signal) // is butt on error state?
+		{
+			if(CurrentTimeMS>=last_tick[7]+200) // Toggle offAir every 200 ms
+			{
+				if(error_led_enabled)
+				{
+					setOut(1,false);
+					error_led_enabled=false;
+					//cout << "e0" << endl;
+				} else {
+					setOut(1,true);
+					error_led_enabled=true;
+					//cout << "e1" << endl;
+				}
+				last_tick[7]=CurrentTimeMS;
 			}
 			WorkedHard=true;
 		}
@@ -250,6 +386,7 @@ int main()
 		{
 			//cout << "Nothing to do" << endl;
 			//cout << CurrentTimeMS << endl;
+			//cout << "LT " <<last_tick[5] << endl;
 			//nanosleep(&ts,NULL);
 			usleep(20000); // Chill for 20 ms, don't wanna block the hosts resources!
 			//cout << "waking up..." << endl;
